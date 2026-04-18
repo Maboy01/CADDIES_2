@@ -1,0 +1,42 @@
+# Archivos de entorno virtual
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Archivos IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Datos grandes (videos)
+videos_160/
+*.mp4
+
+# Archivos binarios
+*.mat
+*.pkl
+
+# Directorios de resultados
+model_results/
+analysis_results/
+uploads/
+
+# Logs
+*.log
+golf_coach.log
+
+# Cache
+.cache/
+.pytest_cache/
+
+# Resultados temporales
+*.json~
+temp/
+tmp/
