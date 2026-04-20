@@ -1,82 +1,76 @@
-# ⛳ CADDIES 2.0 - Golf Coach AI
+# Caddies 2.0 - Golf Swing AI
 
-Modelo de IA para analizar y mejorar swing de golf con **curva de aprendizaje** y **métricas detalladas**.
+Proyecto para entrenar modelos que clasifican swings de golf usando GolfDB.
 
-## 📊 Contenido
+## Scripts principales
 
-- **train_model.py** - Modelo ML con curva de aprendizaje y épocas
-- **GolfDB.csv** - Metadata de 1400+ golpes profesionales
-- **videos_160/** - Videos de swings en 160x160px
+- `train_csv_model.py`: baseline rapido con solo `GolfDB.csv`.
+- `train_cnn_lstm.py`: modelo robusto con videos, CNN por frame y LSTM temporal.
+- `train_model.py`: launcher pequeno; por defecto ejecuta CNN+LSTM.
 
-## 🚀 Inicio Rápido
+## Entrenar CNN+LSTM
 
-```bash
-# Instalar dependencias
-pip install -r requirements.txt
-
-# Entrenar modelo
-python train_model.py
+```powershell
+.\venv\Scripts\python.exe train_cnn_lstm.py --max-videos 115 --epochs 25 --patience 6 --device cuda
 ```
 
-## 📈 Salida
+Opciones utiles:
 
-El script genera automáticamente 4 gráficos:
-
-1. **learning_curve.png** - Curva de aprendizaje (Train vs Validation)
-2. **training_epochs.png** - Loss y Accuracy por época
-3. **confusion_matrix.png** - Matriz de confusión
-4. **metrics_by_class.png** - Precision, Recall, F1 por clase
-
-Se guardan en: `model_results/`
-
-## 🎯 Datos del Modelo
-
-- **Datos**: 1400+ registros de golpes profesionales
-- **Features**: Player, Género, Club, Vista, Cámara Lenta
-- **Target**: Clasificar tipo de palo (driver, iron, fairway, etc)
-- **Algoritmo**: Random Forest
-- **Accuracy**: ~89%
-
-## 📊 Métricas Generadas
-
-```
-✓ Accuracy General
-✓ Precision por clase
-✓ Recall por clase  
-✓ F1-Score por clase
-✓ Curva de aprendizaje
-✓ Épocas de entrenamiento
+```powershell
+.\venv\Scripts\python.exe train_cnn_lstm.py --max-videos 20 --epochs 2 --sequence-length 8 --frame-size 64 --device cuda
+.\venv\Scripts\python.exe train_cnn_lstm.py --max-videos 100 --epochs 10 --sequence-length 16 --frame-size 96 --device cuda
+.\venv\Scripts\python.exe train_cnn_lstm.py --max-videos 115 --epochs 25 --patience 6 --device cuda --use-bbox-crop --bbox-padding 0.45
 ```
 
-## 🔧 Requisitos
+## Entrenar baseline CSV
 
-- Python 3.8+
-- scikit-learn
-- pandas
-- numpy
-- matplotlib
-- seaborn
-
-## 📁 Estructura
-
-```
-CADDIES 2.0/
-├── train_model.py           ← Modelo ML principal
-├── requirements.txt         ← Dependencias
-├── GolfDB.csv              ← Datos profesionales
-├── golfDB.mat              ← Datos MATLAB
-├── GolfDB.pkl              ← Datos serializados
-├── videos_160/             ← 1400 videos
-└── model_results/          ← Gráficos generados
+```powershell
+.\venv\Scripts\python.exe train_csv_model.py --max-rows 50
 ```
 
-## 🎯 Próximos Pasos
+Tambien se puede ejecutar desde el launcher:
 
-- [ ] Agregar procesamiento de videos
-- [ ] Integrar MediaPipe para pose detection
-- [ ] Crear API REST
-- [ ] Dashboard web interactivo
+```powershell
+.\venv\Scripts\python.exe train_model.py --max-videos 50 --epochs 5 --device cuda
+.\venv\Scripts\python.exe train_model.py --csv-baseline --max-rows 50
+```
 
----
+## Resultados
 
-**Próxima versión**: Golf Coach con análisis de poses en tiempo real
+Los resultados se guardan separados:
+
+- `model_results/cnn_lstm/`
+- `model_results/csv_baseline/`
+
+El modelo CNN+LSTM guarda:
+
+- `cnn_lstm_model.pt`
+- `training_history.png`
+- `confusion_matrix.png`
+- `metrics_by_class.png`
+- `prediction_distribution.png`
+- `confidence_distribution.png`
+- `training_history.csv`
+- `class_metrics.csv`
+- `predictions.csv`
+- `run_summary.csv`
+
+## Entrenamiento CNN+LSTM actual
+
+El flujo usa `70%` entrenamiento, `15%` validacion y `15%` test. Tambien usa:
+
+- cache de tensores en `model_results/cnn_lstm/tensor_cache/`
+- augmentations ligeras en entrenamiento
+- `AdamW` con `weight_decay`
+- scheduler de learning rate
+- early stopping por accuracy de validacion
+
+## Dependencias
+
+El entorno local usa PyTorch CUDA:
+
+```text
+torch==2.11.0+cu128
+```
+
+La instalacion usa el indice CUDA de PyTorch definido en `requirements.txt`.
