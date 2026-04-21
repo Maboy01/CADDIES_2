@@ -24,7 +24,6 @@ videos_160/
 *.pkl
 
 # Directorios de resultados
-model_results/
 analysis_results/
 uploads/
 

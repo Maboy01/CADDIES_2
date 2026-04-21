@@ -1,0 +1,2 @@
+test_accuracy,best_epoch,best_validation_accuracy,epochs_ran
+0.25,1,0.125,5
