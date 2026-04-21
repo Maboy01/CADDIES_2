@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import copy
 import math
 from pathlib import Path
 import random
@@ -18,6 +17,7 @@ import sys
 import warnings
 
 import cv2
+import torchvision.models as tv_models
 import matplotlib
 
 matplotlib.use("Agg")
@@ -38,8 +38,7 @@ from sklearn.preprocessing import LabelEncoder
 try:
     import torch
     from torch import nn
-    import torch.nn.functional as F
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, TensorDataset
 except ModuleNotFoundError as error:
     raise SystemExit(
         "PyTorch is required for train_cnn_lstm.py. Install the compatible build, "
@@ -57,14 +56,12 @@ VIDEOS_DIR = BASE_DIR / "videos_160"
 OUTPUT_DIR = BASE_DIR / "model_results" / "cnn_lstm"
 
 RANDOM_STATE = 42
-TEST_SIZE = 0.15
-VALIDATION_SIZE = 0.15
-DEFAULT_MAX_VIDEOS = 50
-DEFAULT_SEQUENCE_LENGTH = 16
-DEFAULT_FRAME_SIZE = 96
-DEFAULT_EPOCHS = 5
+TEST_SIZE = 0.3
+DEFAULT_MAX_VIDEOS = 0
+DEFAULT_SEQUENCE_LENGTH = 24
+DEFAULT_FRAME_SIZE = 112
+DEFAULT_EPOCHS = 25
 DEFAULT_BATCH_SIZE = 4
-TENSOR_CACHE_VERSION = "event_bbox_rgb_v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,101 +101,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-3,
         help="Adam learning rate.",
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-        help="AdamW weight decay.",
-    )
-    parser.add_argument(
-        "--validation-size",
-        type=float,
-        default=VALIDATION_SIZE,
-        help="Fraction of videos reserved for validation.",
-    )
-    parser.add_argument(
-        "--test-size",
-        type=float,
-        default=TEST_SIZE,
-        help="Fraction of videos reserved for final test.",
-    )
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=5,
-        help="Early stopping patience measured in validation epochs.",
-    )
-    parser.add_argument(
-        "--grad-clip",
-        type=float,
-        default=1.0,
-        help="Gradient clipping norm. Use 0 to disable.",
-    )
-    parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=128,
-        help="LSTM hidden size.",
-    )
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.35,
-        help="Dropout used before the classifier.",
-    )
-    parser.add_argument(
-        "--augment",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply lightweight video augmentations to training batches.",
-    )
-    parser.add_argument(
-        "--brightness-jitter",
-        type=float,
-        default=0.15,
-        help="Random brightness jitter used when augmentation is enabled.",
-    )
-    parser.add_argument(
-        "--contrast-jitter",
-        type=float,
-        default=0.15,
-        help="Random contrast jitter used when augmentation is enabled.",
-    )
-    parser.add_argument(
-        "--noise-std",
-        type=float,
-        default=0.01,
-        help="Gaussian noise standard deviation used when augmentation is enabled.",
-    )
-    parser.add_argument(
-        "--crop-scale",
-        type=float,
-        default=0.9,
-        help="Minimum random crop scale used when augmentation is enabled.",
-    )
-    parser.add_argument(
-        "--use-bbox-crop",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Crop frames around the GolfDB bbox before resizing.",
-    )
-    parser.add_argument(
-        "--bbox-padding",
-        type=float,
-        default=0.12,
-        help="Padding added around the normalized GolfDB bbox crop.",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        default=None,
-        help="Folder for cached video tensors. Defaults to output-dir/tensor_cache.",
-    )
-    parser.add_argument(
-        "--refresh-cache",
-        action="store_true",
-        help="Rebuild cached video tensors.",
     )
     parser.add_argument(
         "--device",
@@ -268,6 +170,8 @@ def load_metadata(max_videos: int) -> pd.DataFrame:
         lambda video_id: VIDEOS_DIR / f"{int(video_id)}.mp4"
     )
     dataframe = dataframe[dataframe["video_path"].apply(lambda path: path.exists())].copy()
+    dataframe = dataframe[dataframe["club"].isin(["driver", "fairway", "iron", "hybrid"])].copy()
+    dataframe["club"] = dataframe["club"].map({"driver": "wood", "fairway": "wood", "iron": "iron", "hybrid": "iron"})
 
     if max_videos > 0 and len(dataframe) > max_videos:
         dataframe = sample_balanced_rows(dataframe, max_videos)
@@ -293,14 +197,6 @@ def parse_events(value: object) -> np.ndarray:
     events = np.array(parsed, dtype=float)
     events = events[np.isfinite(events)]
     return np.rint(events).astype(int)
-
-
-def parse_bbox(value: object) -> np.ndarray:
-    raw = str(value).strip().strip("[]")
-    parsed = np.fromstring(raw, sep=" ")
-    if len(parsed) != 4 or not np.all(np.isfinite(parsed)):
-        return np.array([0.0, 0.0, 1.0, 1.0], dtype=float)
-    return np.clip(parsed.astype(float), 0.0, 1.0)
 
 
 def select_evenly(values: np.ndarray, count: int) -> np.ndarray:
@@ -343,43 +239,11 @@ def build_frame_indexes(
     return np.clip(selected_indexes, 0, frame_count - 1).astype(int)
 
 
-def crop_frame_to_bbox(
-    frame: np.ndarray,
-    bbox: np.ndarray,
-    padding: float,
-) -> np.ndarray:
-    height, width = frame.shape[:2]
-    x1, y1, x2, y2 = bbox
-
-    if x2 <= x1 or y2 <= y1:
-        return frame
-
-    box_width = x2 - x1
-    box_height = y2 - y1
-    x1 = max(0.0, x1 - box_width * padding)
-    y1 = max(0.0, y1 - box_height * padding)
-    x2 = min(1.0, x2 + box_width * padding)
-    y2 = min(1.0, y2 + box_height * padding)
-
-    left = int(round(x1 * width))
-    top = int(round(y1 * height))
-    right = int(round(x2 * width))
-    bottom = int(round(y2 * height))
-
-    if right <= left or bottom <= top:
-        return frame
-
-    return frame[top:bottom, left:right]
-
-
 def load_video_sequence(
     video_path: Path,
     events: np.ndarray,
-    bbox: np.ndarray,
     sequence_length: int,
     frame_size: int,
-    use_bbox_crop: bool,
-    bbox_padding: float,
 ) -> np.ndarray:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -403,8 +267,6 @@ def load_video_sequence(
             continue
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        if use_bbox_crop:
-            frame = crop_frame_to_bbox(frame, bbox, bbox_padding)
         frame = cv2.resize(frame, (frame_size, frame_size), interpolation=cv2.INTER_AREA)
         frame = frame.astype(np.float32) / 255.0
         frame = np.transpose(frame, (2, 0, 1))
@@ -414,66 +276,25 @@ def load_video_sequence(
     return np.stack(frames).astype(np.float32)
 
 
-def tensor_cache_path(
-    cache_dir: Path,
-    video_id: int,
-    sequence_length: int,
-    frame_size: int,
-    use_bbox_crop: bool,
-    bbox_padding: float,
-) -> Path:
-    crop_name = "bbox" if use_bbox_crop else "full"
-    padding_name = f"pad{int(round(bbox_padding * 100)):03d}"
-    filename = (
-        f"video_{video_id}_seq{sequence_length}_size{frame_size}_"
-        f"{crop_name}_{padding_name}_{TENSOR_CACHE_VERSION}.npy"
-    )
-    return cache_dir / filename
-
-
 def build_video_tensors(
     dataframe: pd.DataFrame,
     label_encoder: LabelEncoder,
     sequence_length: int,
     frame_size: int,
-    cache_dir: Path,
-    refresh_cache: bool,
-    use_bbox_crop: bool,
-    bbox_padding: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     sequences = []
     targets = []
     total_rows = len(dataframe)
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     for position, row in enumerate(dataframe.itertuples(index=False), start=1):
-        cache_path = tensor_cache_path(
-            cache_dir,
-            int(row.id),
+        print(f"   Loading video {position}/{total_rows}: {Path(row.video_path).name}")
+        events = parse_events(row.events)
+        sequence = load_video_sequence(
+            Path(row.video_path),
+            events,
             sequence_length,
             frame_size,
-            use_bbox_crop,
-            bbox_padding,
         )
-
-        if cache_path.exists() and not refresh_cache:
-            print(f"   Loading cached tensor {position}/{total_rows}: {Path(row.video_path).name}")
-            sequence = np.load(cache_path).astype(np.float32)
-        else:
-            print(f"   Reading video {position}/{total_rows}: {Path(row.video_path).name}")
-            events = parse_events(row.events)
-            bbox = parse_bbox(row.bbox)
-            sequence = load_video_sequence(
-                Path(row.video_path),
-                events,
-                bbox,
-                sequence_length,
-                frame_size,
-                use_bbox_crop,
-                bbox_padding,
-            )
-            np.save(cache_path, sequence)
-
         sequences.append(sequence)
         targets.append(label_encoder.transform([str(row.club)])[0])
 
@@ -482,35 +303,24 @@ def build_video_tensors(
     return sequence_tensor, target_tensor
 
 
+# Después
 class CnnLstmClassifier(nn.Module):
-    def __init__(
-        self,
-        num_classes: int,
-        hidden_size: int = 128,
-        dropout: float = 0.35,
-    ) -> None:
+    def __init__(self, num_classes: int, hidden_size: int = 128) -> None:
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
+        backbone = tv_models.mobilenet_v3_small(weights=tv_models.MobileNet_V3_Small_Weights.DEFAULT)
+        # Usamos el backbone sin la capa clasificadora final
+        self.cnn = nn.Sequential(*list(backbone.children())[:-1])
+        self.cnn_out_size = 576  # salida de MobileNetV3 small
+
         self.lstm = nn.LSTM(
-            input_size=64,
+            input_size=self.cnn_out_size,
             hidden_size=hidden_size,
+            num_layers=2,               # 2 capas LSTM para más capacidad
             batch_first=True,
             bidirectional=True,
+            dropout=0.3,
         )
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(0.4)
         self.classifier = nn.Linear(hidden_size * 2, num_classes)
 
     def forward(self, sequences: torch.Tensor) -> torch.Tensor:
@@ -524,136 +334,29 @@ class CnnLstmClassifier(nn.Module):
         return self.classifier(self.dropout(final_features))
 
 
-def augment_sequence(
-    sequence: torch.Tensor,
-    brightness_jitter: float,
-    contrast_jitter: float,
-    noise_std: float,
-    crop_scale: float,
-) -> torch.Tensor:
-    augmented = sequence.clone()
-
-    if random.random() < 0.5:
-        augmented = torch.flip(augmented, dims=[3])
-
-    if crop_scale < 1.0 and random.random() < 0.75:
-        _time, _channels, height, width = augmented.shape
-        scale = random.uniform(crop_scale, 1.0)
-        crop_height = max(2, int(height * scale))
-        crop_width = max(2, int(width * scale))
-        top = random.randint(0, height - crop_height)
-        left = random.randint(0, width - crop_width)
-        augmented = augmented[:, :, top : top + crop_height, left : left + crop_width]
-        augmented = F.interpolate(
-            augmented,
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-    if brightness_jitter > 0:
-        brightness_factor = random.uniform(1 - brightness_jitter, 1 + brightness_jitter)
-        augmented = augmented * brightness_factor
-
-    if contrast_jitter > 0:
-        contrast_factor = random.uniform(1 - contrast_jitter, 1 + contrast_jitter)
-        mean = augmented.mean(dim=(2, 3), keepdim=True)
-        augmented = (augmented - mean) * contrast_factor + mean
-
-    if noise_std > 0 and random.random() < 0.5:
-        augmented = augmented + torch.randn_like(augmented) * noise_std
-
-    return torch.clamp(augmented, 0.0, 1.0)
-
-
-class VideoSequenceDataset(Dataset):
-    def __init__(
-        self,
-        sequences: torch.Tensor,
-        targets: torch.Tensor,
-        indexes: np.ndarray,
-        augment: bool,
-        args: argparse.Namespace,
-    ) -> None:
-        self.sequences = sequences
-        self.targets = targets
-        self.indexes = indexes.astype(int)
-        self.augment = augment
-        self.args = args
-
-    def __len__(self) -> int:
-        return len(self.indexes)
-
-    def __getitem__(self, item_index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        source_index = int(self.indexes[item_index])
-        sequence = self.sequences[source_index]
-        target = self.targets[source_index]
-
-        if self.augment:
-            sequence = augment_sequence(
-                sequence,
-                self.args.brightness_jitter,
-                self.args.contrast_jitter,
-                self.args.noise_std,
-                self.args.crop_scale,
-            )
-
-        return sequence, target
-
-
-def split_indices(
-    targets: torch.Tensor,
-    validation_size: float,
-    test_size: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def split_indices(targets: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     target_array = targets.numpy()
     class_counts = pd.Series(target_array).value_counts()
     class_count = len(class_counts)
-    can_stratify = class_count > 1 and class_counts.min() >= 3
+    can_stratify = class_count > 1 and class_counts.min() >= 2
 
     if can_stratify:
-        test_count = max(math.ceil(len(target_array) * test_size), class_count)
-        test_count = min(test_count, len(target_array) - (class_count * 2))
-        stratify_targets = target_array
+        test_count = max(math.ceil(len(target_array) * TEST_SIZE), class_count)
+        test_count = min(test_count, len(target_array) - class_count)
+        stratify = target_array
     else:
-        test_count = max(1, math.ceil(len(target_array) * test_size))
-        stratify_targets = None
-        print("   Using non-stratified split because a class has too few videos for 3-way split.")
+        test_count = max(1, math.ceil(len(target_array) * TEST_SIZE))
+        stratify = None
+        print("   Using non-stratified split because a class has too few videos.")
 
     all_indexes = np.arange(len(target_array))
-    train_validation_indexes, test_indexes = train_test_split(
+    train_indexes, test_indexes = train_test_split(
         all_indexes,
         test_size=test_count,
         random_state=RANDOM_STATE,
-        stratify=stratify_targets,
+        stratify=stratify,
     )
-
-    train_validation_targets = target_array[train_validation_indexes]
-    can_stratify_validation = (
-        can_stratify
-        and pd.Series(train_validation_targets).value_counts().min() >= 2
-    )
-
-    if can_stratify_validation:
-        validation_count = max(math.ceil(len(target_array) * validation_size), class_count)
-        validation_count = min(validation_count, len(train_validation_indexes) - class_count)
-        validation_stratify = train_validation_targets
-    else:
-        validation_count = max(1, math.ceil(len(target_array) * validation_size))
-        validation_stratify = None
-
-    train_indexes, validation_indexes = train_test_split(
-        train_validation_indexes,
-        test_size=validation_count,
-        random_state=RANDOM_STATE,
-        stratify=validation_stratify,
-    )
-
-    print(
-        f"   Split: train={len(train_indexes)}, "
-        f"validation={len(validation_indexes)}, test={len(test_indexes)}"
-    )
-    return train_indexes, validation_indexes, test_indexes
+    return train_indexes, test_indexes
 
 
 def build_class_weights(targets: torch.Tensor, num_classes: int, device: torch.device) -> torch.Tensor:
@@ -669,10 +372,8 @@ def make_loader(
     indexes: np.ndarray,
     batch_size: int,
     shuffle: bool,
-    augment: bool,
-    args: argparse.Namespace,
 ) -> DataLoader:
-    dataset = VideoSequenceDataset(sequences, targets, indexes, augment=augment, args=args)
+    dataset = TensorDataset(sequences[indexes], targets[indexes])
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
 
@@ -682,7 +383,6 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    grad_clip: float,
 ) -> tuple[float, float]:
     model.train()
     total_loss = 0.0
@@ -697,8 +397,6 @@ def train_one_epoch(
         logits = model(batch_sequences)
         loss = criterion(logits, batch_targets)
         loss.backward()
-        if grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         batch_size = batch_targets.size(0)
@@ -757,68 +455,26 @@ def train_cnn_lstm(
     args: argparse.Namespace,
     device: torch.device,
 ) -> tuple[nn.Module, dict[str, list[float]], np.ndarray, np.ndarray, np.ndarray]:
-    train_indexes, validation_indexes, test_indexes = split_indices(
-        targets,
-        validation_size=args.validation_size,
-        test_size=args.test_size,
-    )
-    train_loader = make_loader(
-        sequences,
-        targets,
-        train_indexes,
-        args.batch_size,
-        shuffle=True,
-        augment=args.augment,
-        args=args,
-    )
-    validation_loader = make_loader(
-        sequences,
-        targets,
-        validation_indexes,
-        args.batch_size,
-        shuffle=False,
-        augment=False,
-        args=args,
-    )
-    test_loader = make_loader(
-        sequences,
-        targets,
-        test_indexes,
-        args.batch_size,
-        shuffle=False,
-        augment=False,
-        args=args,
-    )
+    train_indexes, test_indexes = split_indices(targets)
+    train_loader = make_loader(sequences, targets, train_indexes, args.batch_size, shuffle=True)
+    test_loader = make_loader(sequences, targets, test_indexes, args.batch_size, shuffle=False)
 
-    model = CnnLstmClassifier(
-        num_classes=num_classes,
-        hidden_size=args.hidden_size,
-        dropout=args.dropout,
-    ).to(device)
+    model = CnnLstmClassifier(num_classes=num_classes).to(device)
     class_weights = build_class_weights(targets[train_indexes], num_classes, device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=2,
+        optimizer, mode="min", patience=3, factor=0.5,
     )
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    early_stop_patience = 6
     history = {
         "train_loss": [],
         "train_accuracy": [],
         "validation_loss": [],
         "validation_accuracy": [],
-        "learning_rate": [],
     }
-    best_validation_accuracy = -1.0
-    best_epoch = 0
-    best_state = copy.deepcopy(model.state_dict())
-    epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_accuracy = train_one_epoch(
@@ -827,7 +483,6 @@ def train_cnn_lstm(
             criterion,
             optimizer,
             device,
-            args.grad_clip,
         )
         (
             validation_loss,
@@ -837,44 +492,35 @@ def train_cnn_lstm(
             _confidences,
         ) = evaluate_model(
             model,
-            validation_loader,
+            test_loader,
             criterion,
             device,
         )
-        scheduler.step(validation_accuracy)
-
         history["train_loss"].append(train_loss)
         history["train_accuracy"].append(train_accuracy)
         history["validation_loss"].append(validation_loss)
         history["validation_accuracy"].append(validation_accuracy)
-        history["learning_rate"].append(optimizer.param_groups[0]["lr"])
 
-        if validation_accuracy > best_validation_accuracy:
-            best_validation_accuracy = validation_accuracy
-            best_epoch = epoch
-            best_state = copy.deepcopy(model.state_dict())
+        # Scheduler y early stopping
+        scheduler.step(validation_loss)
+        if validation_loss < best_val_loss:
+            best_val_loss = validation_loss
+            torch.save(model.state_dict(), args.output_dir / "best_model.pt")
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
+            if epochs_without_improvement >= early_stop_patience:
+                print(f"   Early stopping en época {epoch}")
+                break
 
         print(
             f"Epoch {epoch:02d}/{args.epochs} | "
             f"train_loss={train_loss:.4f} train_acc={train_accuracy:.4f} | "
-            f"val_loss={validation_loss:.4f} val_acc={validation_accuracy:.4f} | "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}"
+            f"val_loss={validation_loss:.4f} val_acc={validation_accuracy:.4f}"
         )
+        
+    model.load_state_dict(torch.load(args.output_dir / "best_model.pt"))
 
-        if args.patience > 0 and epochs_without_improvement >= args.patience:
-            print(
-                f"Early stopping at epoch {epoch}; "
-                f"best validation accuracy was {best_validation_accuracy:.4f} "
-                f"at epoch {best_epoch}."
-            )
-            break
-
-    model.load_state_dict(best_state)
-    history["best_epoch"] = [best_epoch]
-    history["best_validation_accuracy"] = [best_validation_accuracy]
     _loss, _accuracy, predictions, test_targets, confidences = evaluate_model(
         model,
         test_loader,
@@ -1103,7 +749,6 @@ def save_training_tables(
             "train_accuracy": history["train_accuracy"],
             "validation_loss": history["validation_loss"],
             "validation_accuracy": history["validation_accuracy"],
-            "learning_rate": history["learning_rate"],
         }
     )
     history_frame.to_csv(output_dir / "training_history.csv", index=False)
@@ -1135,18 +780,6 @@ def save_training_tables(
     )
     predictions_frame.to_csv(output_dir / "predictions.csv", index=False)
 
-    summary_frame = pd.DataFrame(
-        [
-            {
-                "test_accuracy": metrics["accuracy"],
-                "best_epoch": history["best_epoch"][0],
-                "best_validation_accuracy": history["best_validation_accuracy"][0],
-                "epochs_ran": len(history["train_loss"]),
-            }
-        ]
-    )
-    summary_frame.to_csv(output_dir / "run_summary.csv", index=False)
-
 
 def save_model(
     model: nn.Module,
@@ -1159,8 +792,6 @@ def save_model(
         "classes": label_encoder.classes_.tolist(),
         "sequence_length": args.sequence_length,
         "frame_size": args.frame_size,
-        "hidden_size": args.hidden_size,
-        "dropout": args.dropout,
         "model": "cnn_lstm",
     }
     torch.save(checkpoint, output_dir / "cnn_lstm_model.pt")
@@ -1176,20 +807,6 @@ def main() -> None:
         raise ValueError("--frame-size must be at least 32.")
     if args.epochs < 1:
         raise ValueError("--epochs must be at least 1.")
-    if not 0 < args.validation_size < 0.5:
-        raise ValueError("--validation-size must be between 0 and 0.5.")
-    if not 0 < args.test_size < 0.5:
-        raise ValueError("--test-size must be between 0 and 0.5.")
-    if args.validation_size + args.test_size >= 0.8:
-        raise ValueError("--validation-size plus --test-size must leave enough training data.")
-    if not 0 <= args.dropout < 1:
-        raise ValueError("--dropout must be between 0 and 1.")
-    if not 0 < args.crop_scale <= 1:
-        raise ValueError("--crop-scale must be greater than 0 and at most 1.")
-    if args.bbox_padding < 0:
-        raise ValueError("--bbox-padding must be 0 or greater.")
-    if args.cache_dir is None:
-        args.cache_dir = args.output_dir / "tensor_cache"
 
     set_reproducibility()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1204,10 +821,7 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Max videos: {args.max_videos if args.max_videos else 'all'}")
     print(f"Sequence length: {args.sequence_length}")
-    print(f"Frame size: {args.frame_size}")
-    print(f"Augmentation: {args.augment}")
-    print(f"BBox crop: {args.use_bbox_crop}")
-    print(f"Tensor cache: {args.cache_dir}\n")
+    print(f"Frame size: {args.frame_size}\n")
 
     dataframe = load_metadata(args.max_videos)
     label_encoder = LabelEncoder()
@@ -1217,10 +831,6 @@ def main() -> None:
         label_encoder,
         args.sequence_length,
         args.frame_size,
-        cache_dir=args.cache_dir,
-        refresh_cache=args.refresh_cache,
-        use_bbox_crop=args.use_bbox_crop,
-        bbox_padding=args.bbox_padding,
     )
 
     model, history, predictions, test_targets, confidences = train_cnn_lstm(
